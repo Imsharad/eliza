@@ -114,7 +114,7 @@ export class TwitterPostClient {
    * @returns {Tweet} A Tweet object with specific properties extracted from the tweet result and client information.
    */
   createTweetObject(tweetResult: any, client: any, twitterUsername: string): Tweet {
-    return {
+    const tweet = {
       id: tweetResult.rest_id,
       name: client.profile.screenName,
       username: client.profile.username,
@@ -132,6 +132,17 @@ export class TwitterPostClient {
       urls: [],
       videos: [],
     } as Tweet;
+
+    // Log only the most valuable tweet object data
+    logger.info({
+      action: 'twitter_create_tweet_object',
+      tweetId: tweet.id,
+      userId: tweet.userId,
+      username: tweet.username,
+      url: tweet.permanentUrl,
+    });
+
+    return tweet;
   }
 
   /**
@@ -159,8 +170,13 @@ export class TwitterPostClient {
     // Cache the tweet
     await client.cacheTweet(tweet);
 
-    // Log the posted tweet
-    logger.log(`Tweet posted:\n ${tweet.permanentUrl}`);
+    // Log tweet processing with focused information
+    logger.info({
+      action: 'twitter_process_tweet',
+      tweetId: tweet.id,
+      url: tweet.permanentUrl,
+      roomId,
+    });
 
     // Ensure the room and participant exist
     await runtime.ensureRoomExists({
@@ -237,6 +253,14 @@ export class TwitterPostClient {
     mediaData?: MediaData[]
   ) {
     try {
+      // Log the action being taken (sending a tweet)
+      logger.info({
+        action: 'twitter_send_tweet',
+        contentLength: content.length,
+        isReply: !!tweetId,
+        hasMedia: !!(mediaData && mediaData.length > 0),
+      });
+
       const standardTweetResult = await client.requestQueue.add(
         async () => await client.twitterClient.sendTweet(content, tweetId, mediaData)
       );
@@ -253,16 +277,16 @@ export class TwitterPostClient {
   }
 
   /**
-   * Posts a new tweet with the provided tweet content and optional media data.
+   * Asynchronously posts a tweet to Twitter, replacing any existing instrumentation with a more focused approach.
    *
-   * @param {IAgentRuntime} runtime - The runtime environment for the agent.
-   * @param {ClientBase} client - The Twitter client used to post the tweet.
-   * @param {string} tweetTextForPosting - The text content of the tweet.
-   * @param {UUID} roomId - The ID of the room where the tweet will be posted.
+   * @param {IAgentRuntime} runtime - The runtime environment.
+   * @param {ClientBase} client - The Twitter client instance.
+   * @param {string} tweetTextForPosting - The formatted text for the tweet.
+   * @param {UUID} roomId - The room ID for caching.
    * @param {string} rawTweetContent - The raw content of the tweet.
-   * @param {string} twitterUsername - The username associated with the Twitter account.
-   * @param {MediaData[]} [mediaData] - Optional media data to be included in the tweet.
-   * @returns {Promise<void>} - A Promise that resolves when the tweet is successfully posted.
+   * @param {string} twitterUsername - The Twitter username.
+   * @param {MediaData[]} [mediaData] - Optional media data to include in the tweet.
+   * @returns {Promise<Tweet>} The posted tweet.
    */
   async postTweet(
     runtime: IAgentRuntime,
@@ -274,110 +298,192 @@ export class TwitterPostClient {
     mediaData?: MediaData[]
   ) {
     try {
-      logger.log('Posting new tweet:\n');
+      // Log the LLM-generated tweet content (one of the three key points Monil mentioned)
+      logger.info({
+        action: 'twitter_generated_content',
+        content: rawTweetContent,
+        formattedLength: tweetTextForPosting.length,
+        hasMedia: !!(mediaData && mediaData.length > 0),
+      });
 
-      let result;
-
-      if (tweetTextForPosting.length > 280 - 1) {
-        result = await this.handleNoteTweet(client, tweetTextForPosting, undefined, mediaData);
-      } else {
-        result = await this.sendStandardTweet(client, tweetTextForPosting, undefined, mediaData);
+      let tweetResult;
+      try {
+        if (tweetTextForPosting.length > 280) {
+          // If tweet is > 280 chars, try a note tweet first
+          tweetResult = await this.handleNoteTweet(
+            client,
+            tweetTextForPosting,
+            undefined,
+            mediaData
+          );
+        } else {
+          // Otherwise do a standard tweet
+          tweetResult = await this.sendStandardTweet(
+            client,
+            tweetTextForPosting,
+            undefined,
+            mediaData
+          );
+        }
+      } catch (e) {
+        logger.error('Error posting tweet:', e);
+        throw e;
       }
-      const tweet = this.createTweetObject(result, client, twitterUsername);
 
+      const tweet = this.createTweetObject(tweetResult, client, twitterUsername);
+
+      // Process and cache the tweet
       await this.processAndCacheTweet(runtime, client, tweet, roomId, rawTweetContent);
+
+      // Emit tweet-posted event (the action taken - another key point Monil mentioned)
+      runtime.emitEvent(TwitterEventTypes.POST_SENT, {
+        runtime,
+        message: { content: { text: tweetTextForPosting } },
+        tweetResult,
+      });
+
+      return tweet;
     } catch (error) {
-      logger.error('Error sending tweet:');
+      logger.error('Error in postTweet:', error);
       throw error;
     }
   }
 
   /**
-   * Handles the creation and posting of a tweet by emitting standardized events.
-   * This approach aligns with our platform-independent architecture.
+   * Formats raw tweet text to ensure it meets Twitter requirements.
+   *
+   * @param {string} rawText - The raw text to prepare for Twitter
+   * @returns {string} - The properly formatted tweet text
+   */
+  private prepareTweetText(rawText: string): string {
+    if (!rawText) return '';
+
+    // Ensure text is trimmed
+    let tweetText = rawText.trim();
+
+    // Truncate if necessary to Twitter's character limit
+    if (tweetText.length > 280) {
+      tweetText = truncateToCompleteSentence(tweetText, 280);
+    }
+
+    return tweetText;
+  }
+
+  /**
+   * Generates and posts a new tweet using the character's voice.
    */
   async generateNewTweet() {
     try {
-      // Create the timeline room ID for storing the post
-      const userId = this.client.profile?.id;
-      if (!userId) {
-        logger.error('Cannot generate tweet: Twitter profile not available');
+      // Check if we are in dry run mode
+      if (this.isDryRun) {
+        logger.info({
+          action: 'twitter_dry_run',
+          message: 'Tweet generation skipped - dry run mode enabled',
+        });
         return;
       }
 
-      // Create standardized world and room IDs
-      const worldId = createUniqueUuid(this.runtime, userId) as UUID;
-      const roomId = createUniqueUuid(this.runtime, `${userId}-home`) as UUID;
-      // Create a callback for handling the actual posting
+      // Ensure we have client profile data
+      if (!this.client.profile) {
+        logger.info({
+          action: 'twitter_generate_tweet',
+          status: 'skipped',
+          reason: 'missing_profile',
+        });
+        return;
+      }
+
+      logger.info({
+        action: 'twitter_generate_tweet',
+        status: 'started',
+      });
+
+      // Prepare the timelineRoom ID based on the Twitter user ID
+      const timelineRoomId = createUniqueUuid(
+        this.runtime,
+        `${this.client.profile.id}-home`
+      ) as UUID;
+
+      // Use random tweet generation capability
       const callback: HandlerCallback = async (content: Content) => {
         try {
-          if (this.isDryRun) {
-            logger.info(`[DRY RUN] Would post tweet: ${content.text}`);
+          // Skip empty posts
+          if (!content.text || content.text.trim() === '') {
+            logger.info({
+              action: 'twitter_generate_tweet',
+              status: 'skipped',
+              reason: 'empty_content',
+            });
             return [];
           }
 
-          if (content.text.includes('Error: Missing')) {
-            logger.error('Error: Missing some context', content);
+          // Get text content
+          const rawTweetContent = content.text.trim();
+          // Format tweet text - ensure it meets requirements and isn't empty
+          const tweetTextForPosting = this.prepareTweetText(rawTweetContent);
+
+          if (!tweetTextForPosting || tweetTextForPosting.trim() === '') {
+            logger.info({
+              action: 'twitter_generate_tweet',
+              status: 'skipped',
+              reason: 'empty_formatted_content',
+            });
             return [];
+          }
+
+          // Extract media from content if available
+          const mediaData: MediaData[] = [];
+          if (content.mediaData && Array.isArray(content.mediaData)) {
+            for (const media of content.mediaData) {
+              if (media && media.data) {
+                mediaData.push({
+                  data: media.data,
+                  mediaType: 'image', // Default to image type
+                });
+              }
+            }
           }
 
           // Post the tweet
-          const result = await this.postToTwitter(content.text, content.mediaData as MediaData[]);
-
-          // If result is null, it means we detected a duplicate tweet and skipped posting
-          if (result === null) {
-            logger.info('Skipped posting duplicate tweet');
-            return [];
-          }
-
-          const tweetId =
-            (result as any).rest_id || (result as any).id_str || (result as any).legacy?.id_str;
-
-          if (result) {
-            const postedTweetId = createUniqueUuid(this.runtime, tweetId);
-
-            // Create memory for the posted tweet
-            const postedMemory: Memory = {
-              id: postedTweetId,
-              entityId: this.runtime.agentId,
-              agentId: this.runtime.agentId,
-              roomId,
-              content: {
-                ...content,
-                source: 'twitter',
-                channelType: ChannelType.FEED,
-                type: 'post',
-                metadata: {
-                  tweetId,
-                  postedAt: Date.now(),
-                },
-              },
-              createdAt: Date.now(),
-            };
-
-            await this.runtime.createMemory(postedMemory, 'messages');
-
-            return [postedMemory];
-          }
+          await this.postTweet(
+            this.runtime,
+            this.client,
+            tweetTextForPosting,
+            timelineRoomId,
+            rawTweetContent,
+            this.twitterUsername,
+            mediaData
+          );
 
           return [];
         } catch (error) {
-          logger.error('Error posting tweet:', error, content);
+          logger.error({
+            action: 'twitter_generate_tweet',
+            status: 'error',
+            error: error instanceof Error ? error.message : String(error),
+          });
           return [];
         }
       };
 
-      // Emit event to handle the post generation using standard handlers
-      this.runtime.emitEvent([EventType.POST_GENERATED, TwitterEventTypes.POST_GENERATED], {
+      // Generate the post using the runtime
+      const subject = `Generate a tweet for ${this.twitterUsername}`;
+      const prompt = 'Generate a new tweet from the perspective of the character';
+
+      // Use emitEvent to generate content via the standard flow
+      this.runtime.emitEvent(EventType.POST_GENERATED, {
         runtime: this.runtime,
         callback,
-        worldId,
-        userId,
-        roomId,
         source: 'twitter',
+        subject,
+        context: prompt,
       });
     } catch (error) {
-      logger.error('Error generating tweet:', error);
+      logger.error({
+        action: 'twitter_generate_tweet',
+        status: 'error',
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
